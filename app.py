@@ -1,0 +1,150 @@
+
+# Streamlit App: Interactive KML Viewer with Zoom and SVG Export
+
+import streamlit as st
+import zipfile
+import os
+import shutil
+import xml.etree.ElementTree as ET
+from xml.dom.minidom import Document
+import matplotlib.pyplot as plt
+from io import BytesIO
+import base64
+import re
+
+# --- Setup ---
+st.set_page_config(layout="wide")
+st.title("KML Interactive Viewer and SVG Exporter")
+
+# Clean up and prepare folders
+shutil.rmtree("svg_layers", ignore_errors=True)
+os.makedirs("svg_layers", exist_ok=True)
+
+# --- Upload KMZ File ---
+uploaded_file = st.file_uploader("Upload KMZ file from Google My Maps", type="kmz")
+
+if uploaded_file:
+    kmz_path = "uploaded_map.kmz"
+    with open(kmz_path, "wb") as f:
+        f.write(uploaded_file.read())
+
+    # --- Extract KML ---
+    kml_filename = None
+    with zipfile.ZipFile(kmz_path, 'r') as kmz:
+        for name in kmz.namelist():
+            if name.endswith('.kml'):
+                kml_filename = name
+                kmz.extract(name, path=".")
+                break
+
+    if not kml_filename:
+        st.error("No KML file found in KMZ.")
+    else:
+        # --- Parse KML ---
+        tree = ET.parse(kml_filename)
+        root = tree.getroot()
+        ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+
+        folders = root.findall('.//kml:Folder', ns)
+        all_coords = []
+        folder_coords = {}
+
+        for folder in folders:
+            folder_name_elem = folder.find('kml:name', ns)
+            folder_name = folder_name_elem.text.strip() if folder_name_elem is not None else 'Unnamed'
+            coords = []
+
+            for placemark in folder.findall('.//kml:Placemark', ns):
+                for point in placemark.findall('.//kml:Point', ns):
+                    coord_text = point.find('.//kml:coordinates', ns).text.strip()
+                    lon, lat, *_ = map(float, coord_text.split(','))
+                    coords.append((lon, lat))
+                    all_coords.append((lon, lat))
+
+            if coords:
+                folder_coords[folder_name] = coords
+
+        if not all_coords:
+            st.error("No coordinates found in KML file.")
+        else:
+            # --- Get map bounds ---
+            lons, lats = zip(*all_coords)
+            min_lon, max_lon = min(lons), max(lons)
+            min_lat, max_lat = min(lats), max(lats)
+            center_lon = (min_lon + max_lon) / 2
+            center_lat = (min_lat + max_lat) / 2
+
+            # --- Zoom & Pan Controls ---
+            st.sidebar.header("Zoom & Pan")
+            zoom = st.sidebar.slider("Zoom Level (higher = closer)", min_value=1, max_value=20, value=5)
+            pan_lat = st.sidebar.slider("Center Latitude", min_lat, max_lat, center_lat)
+            pan_lon = st.sidebar.slider("Center Longitude", min_lon, max_lon, center_lon)
+
+            zoom_range = 1.0 / zoom
+            view_min_lat = pan_lat - zoom_range
+            view_max_lat = pan_lat + zoom_range
+            view_min_lon = pan_lon - zoom_range
+            view_max_lon = pan_lon + zoom_range
+
+            # --- Folder Selector ---
+            selected_folders = st.multiselect("Select folders to display/export", options=list(folder_coords.keys()), default=list(folder_coords.keys()))
+
+            fig, ax = plt.subplots()
+
+            for folder_name in selected_folders:
+                coords = folder_coords[folder_name]
+                visible_coords = [(lon, lat) for lon, lat in coords if view_min_lon < lon < view_max_lon and view_min_lat < lat < view_max_lat]
+                if visible_coords:
+                    xs, ys = zip(*visible_coords)
+                    ax.scatter(xs, ys, label=folder_name, s=10)
+
+            ax.set_xlim(view_min_lon, view_max_lon)
+            ax.set_ylim(view_min_lat, view_max_lat)
+            ax.set_title("Map Preview")
+            ax.legend()
+            st.pyplot(fig)
+
+            # --- Export SVG ---
+            def normalize_coords(lon, lat, width=1000, height=1000):
+                x = (lon - view_min_lon) / (view_max_lon - view_min_lon) * width
+                y = height - (lat - view_min_lat) / (view_max_lat - view_min_lat) * height
+                return x, y
+
+            for folder_name in selected_folders:
+                coords = folder_coords[folder_name]
+                visible_coords = [(lon, lat) for lon, lat in coords if view_min_lon < lon < view_max_lon and view_min_lat < lat < view_max_lat]
+                norm_coords = [normalize_coords(lon, lat) for lon, lat in visible_coords]
+
+                doc = Document()
+                svg = doc.createElement('svg')
+                svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+                svg.setAttribute('width', '1000')
+                svg.setAttribute('height', '1000')
+                doc.appendChild(svg)
+
+                for x, y in norm_coords:
+                    circle = doc.createElement('circle')
+                    circle.setAttribute('cx', str(x))
+                    circle.setAttribute('cy', str(y))
+                    circle.setAttribute('r', '5')
+                    circle.setAttribute('fill', 'red')
+                    svg.appendChild(circle)
+
+                safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', folder_name)
+                filename = f"svg_layers/{safe_name}.svg"
+                with open(filename, "w") as f:
+                    f.write(doc.toprettyxml())
+
+            # ZIP the SVG files
+            zip_buf = BytesIO()
+            with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for svg_file in os.listdir("svg_layers"):
+                    path = os.path.join("svg_layers", svg_file)
+                    zipf.write(path, svg_file)
+
+            st.download_button(
+                label="Download SVG ZIP",
+                data=zip_buf.getvalue(),
+                file_name="svg_layers_export.zip",
+                mime="application/zip"
+            )
